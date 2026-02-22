@@ -2,6 +2,9 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 
 const STORAGE_KEY = 'chat_app_v1'
 const ROUTER_URL = process.env.NEXT_PUBLIC_ROUTER_URL || 'http://localhost:8080'
+const LM_STUDIO_BASE_URL = process.env.NEXT_PUBLIC_LM_STUDIO_BASE_URL || 'http://127.0.0.1:1234/v1'
+const LM_STUDIO_DEFAULT_MODEL = process.env.NEXT_PUBLIC_LM_STUDIO_MODEL || ''
+const LM_STUDIO_API_KEY = process.env.NEXT_PUBLIC_LM_STUDIO_API_KEY || ''
 const ROUTE_TIMEOUT_MS = 1000
 const RUN_TIMEOUT_MS = 30000
 const DEFAULT_MAX_TOKENS = 256
@@ -53,13 +56,16 @@ function withTimeoutSignal(ms, parentSignal) {
   }
 }
 
-async function postJson(url, body, { timeoutMs, signal }) {
+async function postJson(url, body, { timeoutMs, signal, headers }) {
   const timeout = withTimeoutSignal(timeoutMs, signal)
 
   try {
     const response = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(headers || {}),
+      },
       body: JSON.stringify(body),
       signal: timeout.signal,
     })
@@ -72,7 +78,7 @@ async function postJson(url, body, { timeoutMs, signal }) {
     }
 
     if (!response.ok) {
-      const detail = data?.detail || data?.error || `HTTP_${response.status}`
+      const detail = data?.detail || data?.error?.message || data?.error || `HTTP_${response.status}`
       const error = new Error(detail)
       error.status = response.status
       error.payload = data
@@ -93,7 +99,11 @@ function makeChat() {
 export default function HomePage() {
   const [chats, setChats] = useState([])
   const [currentChatId, setCurrentChatId] = useState(null)
+  const [backend, setBackend] = useState('router')
   const [model, setModel] = useState('mock-small')
+  const [lmStudioBaseUrl, setLmStudioBaseUrl] = useState(LM_STUDIO_BASE_URL)
+  const [lmStudioModel, setLmStudioModel] = useState(LM_STUDIO_DEFAULT_MODEL)
+  const [lmStudioApiKey, setLmStudioApiKey] = useState(LM_STUDIO_API_KEY)
   const [prompt, setPrompt] = useState('')
   const [isSending, setIsSending] = useState(false)
   const [routeInfo, setRouteInfo] = useState(null)
@@ -199,6 +209,104 @@ export default function HomePage() {
     })
   }
 
+  async function requestLmStudioRun(baseUrl, runRequest, signal) {
+    const payload = {
+      base_url: baseUrl,
+      model: runRequest.model_id,
+      messages: runRequest.messages,
+      max_tokens: runRequest.max_tokens,
+      stream: false,
+    }
+    const key = String(lmStudioApiKey || '').trim()
+
+    return postJson(`http://localhost:8080/lmstudio`, payload, {
+      timeoutMs: RUN_TIMEOUT_MS,
+      signal,
+      headers: key ? { Authorization: `Bearer ${key}` } : undefined,
+    })
+  }
+
+  async function runViaRouter({ chatId, requestId, routeRequest, runRequest, signal }) {
+    let lastRunError = null
+    let selectedRoute = await requestRoute(routeRequest, signal)
+
+    setRouteInfo({
+      requestId,
+      serverId: selectedRoute.server_id,
+      endpoint: selectedRoute.endpoint,
+      reason: selectedRoute.reason,
+      elapsedMs: null,
+      cached: false,
+    })
+
+    for (let runAttempt = 0; runAttempt < 2; runAttempt += 1) {
+      const routeForAttempt = runAttempt === 0 ? selectedRoute : await requestRoute(routeRequest, signal)
+
+      if (runAttempt > 0) {
+        selectedRoute = routeForAttempt
+        setRouteInfo({
+          requestId,
+          serverId: routeForAttempt.server_id,
+          endpoint: routeForAttempt.endpoint,
+          reason: `${routeForAttempt.reason} (rerouted after endpoint failure)`,
+          elapsedMs: null,
+          cached: false,
+        })
+      }
+
+      try {
+        const runResponse = await requestRun(routeForAttempt.endpoint, runRequest, signal)
+
+        replaceThinkingMessage(chatId, runResponse?.output?.content || '(empty response)')
+        setRouteInfo({
+          requestId,
+          serverId: routeForAttempt.server_id,
+          endpoint: routeForAttempt.endpoint,
+          reason: routeForAttempt.reason,
+          elapsedMs: runResponse?.timing?.elapsed_ms ?? null,
+          cached: Boolean(runResponse?.cached),
+        })
+        return
+      } catch (error) {
+        lastRunError = error
+        if (runAttempt === 0 && isEndpointUnreachable(error)) {
+          continue
+        }
+        throw error
+      }
+    }
+
+    throw lastRunError || new Error('Run failed')
+  }
+
+  async function runViaLmStudio({ chatId, requestId, runRequest, signal }) {
+    const baseUrl = String(lmStudioBaseUrl || '').trim().replace(/\/+$/, '')
+    const modelId = String(lmStudioModel || '').trim()
+    if (!baseUrl) throw new Error('LM Studio URL is required')
+    if (!modelId) throw new Error('LM Studio model is required')
+
+    const startedAt = nowMs()
+    const runResponse = await requestLmStudioRun(
+      baseUrl,
+      { ...runRequest, model_id: modelId },
+      signal,
+    )
+    const assistantText =
+      runResponse?.choices?.[0]?.message?.content ??
+      runResponse?.choices?.[0]?.text ??
+      '(empty response)'
+
+    replaceThinkingMessage(chatId, assistantText)
+    setRouteInfo({
+      requestId,
+      serverId: 'lm-studio-local',
+      endpoint: baseUrl,
+      reason: 'direct_local_lm_studio',
+      elapsedMs: nowMs() - startedAt,
+      cached: false,
+    })
+  }
+
   async function sendPrompt() {
     const text = prompt.trim()
     if (!text || !currentChatId || !currentChat || isSending) return
@@ -217,7 +325,8 @@ export default function HomePage() {
     setIsSending(true)
 
     appendMessageToChat(chatId, 'user', text)
-    appendMessageToChat(chatId, 'assistant', `... thinking (${model})`)
+    const activeModel = backend === 'lmstudio' ? lmStudioModel : model
+    appendMessageToChat(chatId, 'assistant', `... thinking (${activeModel || 'unknown-model'})`)
 
     const controller = new AbortController()
     activeRequestRef.current = controller
@@ -225,7 +334,7 @@ export default function HomePage() {
     const routeRequest = {
       request_id: requestId,
       timestamp_ms: timestampMs,
-      model_id: model,
+      model_id: backend === 'lmstudio' ? lmStudioModel : model,
       prompt_chars: promptChars,
       estimated_prompt_tokens: estimatedPromptTokens,
       max_tokens: DEFAULT_MAX_TOKENS,
@@ -234,63 +343,28 @@ export default function HomePage() {
     const runRequest = {
       request_id: requestId,
       timestamp_ms: timestampMs,
-      model_id: model,
+      model_id: backend === 'lmstudio' ? lmStudioModel : model,
       max_tokens: DEFAULT_MAX_TOKENS,
       messages: nextMessages,
     }
 
-    let lastRunError = null
-
     try {
-      let selectedRoute = await requestRoute(routeRequest, controller.signal)
-
-      setRouteInfo({
-        requestId,
-        serverId: selectedRoute.server_id,
-        endpoint: selectedRoute.endpoint,
-        reason: selectedRoute.reason,
-        elapsedMs: null,
-        cached: false,
-      })
-
-      for (let runAttempt = 0; runAttempt < 2; runAttempt += 1) {
-        const routeForAttempt = runAttempt === 0 ? selectedRoute : await requestRoute(routeRequest, controller.signal)
-
-        if (runAttempt > 0) {
-          selectedRoute = routeForAttempt
-          setRouteInfo({
-            requestId,
-            serverId: routeForAttempt.server_id,
-            endpoint: routeForAttempt.endpoint,
-            reason: `${routeForAttempt.reason} (rerouted after endpoint failure)`,
-            elapsedMs: null,
-            cached: false,
-          })
-        }
-
-        try {
-          const runResponse = await requestRun(routeForAttempt.endpoint, runRequest, controller.signal)
-
-          replaceThinkingMessage(chatId, runResponse?.output?.content || '(empty response)')
-          setRouteInfo({
-            requestId,
-            serverId: routeForAttempt.server_id,
-            endpoint: routeForAttempt.endpoint,
-            reason: routeForAttempt.reason,
-            elapsedMs: runResponse?.timing?.elapsed_ms ?? null,
-            cached: Boolean(runResponse?.cached),
-          })
-          return
-        } catch (error) {
-          lastRunError = error
-          if (runAttempt === 0 && isEndpointUnreachable(error)) {
-            continue
-          }
-          throw error
-        }
+      if (backend === 'lmstudio') {
+        await runViaLmStudio({
+          chatId,
+          requestId,
+          runRequest,
+          signal: controller.signal,
+        })
+      } else {
+        await runViaRouter({
+          chatId,
+          requestId,
+          routeRequest,
+          runRequest,
+          signal: controller.signal,
+        })
       }
-
-      throw lastRunError || new Error('Run failed')
     } catch (error) {
       if (isAbortError(error)) {
         replaceThinkingMessage(chatId, '[Request canceled]')
@@ -337,17 +411,40 @@ export default function HomePage() {
       <main className="main">
         <header className="main-header">
           <div className="model-select">
-            <label htmlFor="modelSelect">Model:</label>
+            <label htmlFor="backendSelect">Backend:</label>
             <select
-              id="modelSelect"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
+              id="backendSelect"
+              value={backend}
+              onChange={(e) => setBackend(e.target.value)}
               disabled={isSending}
             >
-              <option value="mock-small">mock-small</option>
-              <option value="mock-large">mock-large</option>
-              <option value="gpt-5-mini">gpt-5-mini</option>
+              <option value="router">Router + Compute</option>
+              <option value="lmstudio">LM Studio (local)</option>
             </select>
+          </div>
+
+          <div className="model-select">
+            <label htmlFor="modelSelect">Model:</label>
+            {backend === 'lmstudio' ? (
+              <input
+                id="modelSelect"
+                value={lmStudioModel}
+                onChange={(e) => setLmStudioModel(e.target.value)}
+                disabled={isSending}
+                placeholder="e.g. llama-3.2-3b-instruct"
+              />
+            ) : (
+              <select
+                id="modelSelect"
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                disabled={isSending}
+              >
+                <option value="mock-small">mock-small</option>
+                <option value="mock-large">mock-large</option>
+                <option value="gpt-5-mini">gpt-5-mini</option>
+              </select>
+            )}
           </div>
 
           <div className="chat-title">{currentChat?.title || 'Select a chat'}</div>
@@ -360,6 +457,32 @@ export default function HomePage() {
             </div>
           )}
         </header>
+
+        {backend === 'lmstudio' && (
+          <div
+            style={{
+              display: 'flex',
+              gap: 8,
+              padding: '8px 12px',
+              borderBottom: '1px solid rgba(255,255,255,0.03)',
+            }}
+          >
+            <input
+              value={lmStudioBaseUrl}
+              onChange={(e) => setLmStudioBaseUrl(e.target.value)}
+              disabled={isSending}
+              placeholder="LM Studio base URL (e.g. http://127.0.0.1:1234/v1)"
+              style={{ flex: 2 }}
+            />
+            <input
+              value={lmStudioApiKey}
+              onChange={(e) => setLmStudioApiKey(e.target.value)}
+              disabled={isSending}
+              placeholder="API key (optional)"
+              style={{ flex: 1 }}
+            />
+          </div>
+        )}
 
         <section ref={messagesRef} className="messages">
           {currentChat?.messages?.map((m, index) => (
