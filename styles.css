@@ -25,3 +25,45 @@ body{margin:0;font-family:Inter,Segoe UI,Roboto,Helvetica,Arial,sans-serif;backg
 .composer{display:flex;gap:8px;padding:12px;border-top:1px solid rgba(255,255,255,0.03);background:var(--surface)}
 .composer textarea{flex:1;min-height:48px;padding:8px;border-radius:6px;border:1px solid rgba(255,255,255,0.03);background:transparent;color:#eaf2ff}
 .composer button{background:var(--accent);border:none;color:#fff;padding:10px 14px;border-radius:6px;cursor:pointer}
+
+body {
+  background: radial-gradient(
+    circle at 20% 20%,
+    #1e293b,
+    #0f172a 60%
+  );
+}
+
+.message-ai {
+  background: linear-gradient(135deg, #1e3a8a, #312e81);
+  border-radius: 16px;
+  padding: 14px 18px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+}
+
+.message-user {
+  background: #2563eb;
+  border-radius: 16px;
+}
+
+.model-badge {
+  background: rgba(255,255,255,0.08);
+  padding: 6px 12px;
+  border-radius: 999px;
+  backdrop-filter: blur(10px);
+}
+
+.message {
+  animation: fadeIn 0.3s ease-out;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
