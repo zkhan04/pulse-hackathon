@@ -15,6 +15,6 @@ Files added:
 - styles.css — styling
 - app.js — chat state, mock LLM replies, and localStorage persistence
 
-Run locally: open `index.html` in your browser (no server required).
+Run locally: run "npm run dev"
 
 Notes: The demo uses a mock reply generator in `app.js`. Replace the mock call with an API request to your LLM backend when ready.
