@@ -1,0 +1,17 @@
+{
+  "request_id": "0f6f0c2a-44a6-4db3-9f55-dedddaf9d7ce",
+  "model_id": "gpt-5-mini",
+  "cached": false,
+  "output": {
+    "role": "assistant",
+    "content": "Hello from a fixture response."
+  },
+  "usage": {
+    "prompt_tokens": 24,
+    "completion_tokens": 8,
+    "total_tokens": 32
+  },
+  "timing": {
+    "elapsed_ms": 412
+  }
+}
