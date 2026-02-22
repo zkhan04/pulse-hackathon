@@ -107,7 +107,7 @@ function init(){
   $('newChatBtn').addEventListener('click', newChat)
   $('sendBtn').addEventListener('click', sendPrompt)
   $('promptInput').addEventListener('keydown', (e)=>{
-    if(e.key==='Enter' && (e.ctrlKey||e.metaKey)) sendPrompt()
+    if(e.key==='Enter') sendPrompt()
   })
   renderChatList()
   if(!currentChatId) currentChatId = chats[0] && chats[0].id
