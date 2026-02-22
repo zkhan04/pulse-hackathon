@@ -1,0 +1,27 @@
+:root{
+  --bg:#0f1724;
+  --panel:#0b1220;
+  --muted:#94a3b8;
+  --accent:#2563eb;
+  --surface:#07111a;
+  --msg-user:#063970;
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:Inter,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:linear-gradient(180deg,#071024, #07111a);color:#e6eef8;height:100vh}
+.app{display:flex;height:100vh}
+.sidebar{width:260px;background:var(--panel);border-right:1px solid rgba(255,255,255,0.03);display:flex;flex-direction:column}
+.sidebar-header{display:flex;align-items:center;justify-content:space-between;padding:12px}
+.chat-list{list-style:none;padding:8px;margin:0;overflow:auto}
+.chat-list li{padding:10px;border-radius:6px;margin-bottom:6px;cursor:pointer;color:var(--muted)}
+.chat-list li.active{background:rgba(255,255,255,0.03);color:#fff}
+.main{flex:1;display:flex;flex-direction:column}
+.main-header{display:flex;align-items:center;gap:16px;padding:12px;border-bottom:1px solid rgba(255,255,255,0.03)}
+.model-select label{margin-right:8px;color:var(--muted)}
+.chat-title{font-weight:600}
+.messages{flex:1;padding:16px;overflow:auto;display:flex;flex-direction:column;gap:12px;background:linear-gradient(180deg,transparent,rgba(0,0,0,0.04))}
+.message{max-width:70%;padding:10px 12px;border-radius:10px}
+.message.user{align-self:flex-end;background:linear-gradient(90deg,var(--msg-user),#0b6bd6);color:white}
+.message.assistant{align-self:flex-start;background:rgba(255,255,255,0.03);color:var(--muted)}
+.composer{display:flex;gap:8px;padding:12px;border-top:1px solid rgba(255,255,255,0.03);background:var(--surface)}
+.composer textarea{flex:1;min-height:48px;padding:8px;border-radius:6px;border:1px solid rgba(255,255,255,0.03);background:transparent;color:#eaf2ff}
+.composer button{background:var(--accent);border:none;color:#fff;padding:10px 14px;border-radius:6px;cursor:pointer}

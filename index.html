@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Chat Demo</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <h2>Chats</h2>
+        <button id="newChatBtn">+ New</button>
+      </div>
+      <ul id="chatList" class="chat-list"></ul>
+    </aside>
+    <main class="main">
+      <header class="main-header">
+        <div class="model-select">
+          <label for="modelSelect">Model:</label>
+          <select id="modelSelect">
+            <option value="mock-small">mock-small</option>
+            <option value="mock-large">mock-large</option>
+            <option value="gpt-5-mini">gpt-5-mini</option>
+          </select>
+        </div>
+        <div id="chatTitle" class="chat-title">Select a chat</div>
+      </header>
+
+      <section id="messages" class="messages"></section>
+
+      <footer class="composer">
+        <textarea id="promptInput" placeholder="Type a message and press Send"></textarea>
+        <button id="sendBtn">Send</button>
+      </footer>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
