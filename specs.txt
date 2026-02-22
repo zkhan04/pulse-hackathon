@@ -1,0 +1,758 @@
+Project description
+Build a LAN-only “LLM query router” that routes chat requests to nearby trusted machines running local open-source models (via LMStudio), to reduce reliance on remote datacenters. The client chooses the model explicitly (no auto model selection). The router never sees prompt content; it only uses metadata + server stats to pick a compute server. Compute servers run a lightweight sidecar agent that reports capabilities and live load, enforces concurrency, and proxies requests to LMStudio.
+
+Components, responsibilities, and contracts
+1) React Client (UI + client networking)
+Responsibilities
+ChatGPT-like UI: message list, input box, model dropdown.
+
+
+Maintain conversation history client-side and include it in each /run.
+Assume that we already know the IP address/port of the router
+
+
+For each user send:
+
+
+generate request_id (UUID) once
+
+
+compute prompt_chars (and optionally estimated_prompt_tokens = ceil(chars/4))
+
+
+choose max_tokens (fixed default is fine for demo)
+
+
+call router /route (metadata only)
+
+
+call compute agent /run (full request)
+
+
+Reliability:
+
+
+timeouts + AbortController cancel
+
+
+at most 1 retry on /run using the same request_id
+
+
+if compute endpoint is unreachable, re-call /route and try another server (still same request_id)
+
+
+What it must NOT do
+No streaming.
+
+
+No server-side state assumptions (history stays client-side).
+
+
+No tokenizers required (chars/4 estimate is fine).
+
+
+Contracts it uses
+POST /route on router (RouteRequest → RouteResponse)
+
+
+POST /run on compute agent (RunRequest → RunResponse)
+
+
+
+2) Routing Server (Go)
+Responsibilities
+Maintain registry of compute servers and their static capabilities.
+
+
+Maintain dynamic state from heartbeats (in_flight, status, ema_tps, last_seen).
+
+
+Decide routing for each incoming metadata request.
+
+
+State it keeps
+capabilities[server_id] from /register
+
+
+state[server_id] from /heartbeat (+ derived DOWN if stale)
+
+
+Failure detection
+Mark a server DOWN if it misses heartbeats for ~3 * interval + grace (demo default: heartbeat every 2s, down after ~7s).
+
+
+Exclude DOWN servers from routing.
+
+
+Scheduling policy (v0)
+Filter to servers that:
+
+
+are registered
+
+
+support model_id
+
+
+are not DOWN
+
+
+status != DRAINING
+
+
+Choose the server with:
+
+
+lowest in_flight
+
+
+tie-break by estimated runtime:
+
+
+estimated_runtime ≈ (estimated_prompt_tokens + max_tokens) / max(ema_tps, fallback_tps)
+
+
+if estimated_prompt_tokens missing, use ceil(prompt_chars/4)
+
+
+fallback_tps constant if ema_tps missing
+
+
+Contracts it serves
+POST /register (compute → router): static capabilities
+
+
+POST /heartbeat (compute → router): dynamic load
+
+
+POST /route (client → router): routing decision
+
+
+
+3) Compute Agent (Python + FastAPI) running on each compute server
+Responsibilities
+Proxy execution requests to LMStudio.
+
+
+Enforce availability/concurrency (LLM servers are “single-lane bridges”):
+
+
+demo default: max_concurrency = 1
+
+
+track in_flight
+
+
+if at capacity and no queue: return 429 SERVER_BUSY
+
+
+Provide idempotency so client retries don’t double-run:
+
+
+cache request_id -> full RunResponse for ~2–5 minutes
+
+
+duplicates return cached response (optionally cached: true)
+
+
+Measure performance and report dynamic load:
+
+
+measure elapsed_ms for each job
+
+
+compute throughput (tokens/sec) if possible:
+
+
+best: parse LMStudio response usage.completion_tokens
+
+
+fallback: estimate completion tokens as ceil(len(output_text)/4)
+
+
+update ema_tps (α ~ 0.2; ignore tiny jobs to reduce noise)
+
+
+On startup:
+
+
+call router /register once with capabilities
+
+
+Continuously:
+
+
+send router /heartbeat every ~2 seconds with dynamic stats
+
+
+Availability definition
+READY if in_flight < max_concurrency
+
+
+BUSY if in_flight == max_concurrency
+
+
+DRAINING if refusing new work (manual switch for demo control)
+
+
+Router infers DOWN when heartbeats stop.
+
+
+Contracts it serves
+POST /run (client → compute): full request, non-streaming response
+
+
+Contracts it calls
+POST /register (compute → router)
+
+
+POST /heartbeat (compute → router)
+
+
+
+4) LMStudio (local model host)
+Responsibilities
+Actually run the model.
+
+
+Expose an HTTP API that the compute agent proxies to.
+
+
+The compute agent is responsible for:
+
+
+translating your simplified schema to LMStudio’s expected format
+
+
+extracting usage metrics if provided
+
+
+Important constraint
+Don’t rely on LMStudio for stats/availability; treat it as the “engine” only. The sidecar agent is your control plane.
+
+
+
+Shared contracts (the schema you all code against)
+Router-facing metadata (client → router /route)
+Required:
+request_id (UUID)
+
+
+timestamp_ms
+
+
+model_id
+
+
+prompt_chars
+
+
+max_tokens
+ Optional:
+
+
+estimated_prompt_tokens (else router estimates from chars)
+
+
+Compute capability (compute → router /register)
+Required:
+server_id
+
+
+endpoint (compute agent base URL)
+
+
+models (array of model_id)
+
+
+max_concurrency
+
+
+device_type (CPU/GPU)
+ Optional:
+
+
+context_limit
+
+
+vram_gb
+
+
+Heartbeat (compute → router /heartbeat)
+Required:
+server_id
+
+
+timestamp_ms
+
+
+status (READY/BUSY/DRAINING)
+
+
+in_flight
+ Optional:
+
+
+ema_tps
+
+
+last_job_ms
+
+
+Full run (client → compute /run)
+Required:
+request_id
+
+
+timestamp_ms
+
+
+model_id
+
+
+max_tokens
+
+
+messages[] with {role: system|user|assistant, content: string}
+
+
+Response:
+request_id, model_id
+
+
+output: {role: assistant, content}
+
+
+timing.elapsed_ms
+
+
+usage (real if available, else estimated/nulls)
+
+
+optional cached: true if served from idempotency cache
+
+
+
+Default timeouts and retry rules (client-side)
+Router /route timeout: ~1s
+
+
+Compute /run connect timeout: ~500ms
+
+
+Compute /run overall timeout: ~30s (optionally 60s for big models)
+
+
+Retry: 1 retry max on /run with the same request_id
+
+
+If endpoint unreachable: re-route and try another server
+
+
+
+Recommended build plan so everyone can work independently
+Router engineer (Go)
+Implement /register, /heartbeat, /route
+
+
+In-memory maps for capabilities/state
+
+
+DOWN detection by missed heartbeats
+
+
+Routing score function (least in_flight + runtime tie-break)
+
+
+Compute agent engineer (FastAPI)
+Implement /run with concurrency gate + idempotency cache
+
+
+Proxy to LMStudio
+
+
+Measure elapsed_ms
+
+
+Compute token estimate and EMA TPS
+
+
+Implement register-on-start and periodic heartbeat loop
+
+
+Frontend engineer (React)
+Chat UI + model dropdown
+
+
+Implement send flow: /route → /run
+
+
+Timeouts + cancel + 1 retry
+
+
+Display: server chosen + latency (nice demo polish)
+
+
+
+If you want one extra “alignment booster”: agree on a canonical model_id list up front (even just 2–3 entries) and have each compute agent map those to its local LMStudio model names. That prevents the “same model, different string” bug that kills demos.
+
+openapi: 3.0.3
+info:
+  title: Network Contract v0 (Hackathon)
+  version: "0.0.1"
+  description: |
+    Minimal LAN routing + compute agent contract for non-streaming LLM chat.
+    Trusted network, <=5 servers, no version negotiation, no multimodal.
+
+servers:
+  - url: http://localhost:8080
+    description: Router (example)
+  - url: http://localhost:8081
+    description: Compute Agent (example)
+
+tags:
+  - name: router
+    description: Endpoints served by the routing server
+  - name: compute
+    description: Endpoints served by the compute agent
+
+paths:
+  /register:
+    post:
+      tags: [router]
+      summary: Compute -> Router one-time registration (capabilities)
+      operationId: registerCompute
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      responses:
+        "200":
+          description: Registered OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+
+  /heartbeat:
+    post:
+      tags: [router]
+      summary: Compute -> Router heartbeat (dynamic load)
+      operationId: heartbeat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HeartbeatRequest"
+      responses:
+        "200":
+          description: Heartbeat accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+
+  /route:
+    post:
+      tags: [router]
+      summary: Client -> Router route selection (metadata only)
+      operationId: routeRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RouteRequest"
+      responses:
+        "200":
+          description: Routing decision
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RouteResponse"
+        "503":
+          description: No capable servers
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Optional duplicate request id handling
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /run:
+    post:
+      tags: [compute]
+      summary: Client -> Compute run (full request; non-streaming)
+      operationId: runCompletion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RunRequest"
+      responses:
+        "200":
+          description: Completion result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RunResponse"
+        "400":
+          description: Bad request / unknown model
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Server busy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "504":
+          description: Upstream timeout
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  schemas:
+    OkResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        ok:
+          type: boolean
+      required: [ok]
+
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        error:
+          type: string
+          description: Machine-readable error code
+          example: NO_CAPABLE_SERVERS
+        detail:
+          type: string
+          description: Human-readable details
+          example: No servers currently support model_id=llama3.1-8b-instruct-q4_k_m
+      required: [error, detail]
+
+    Status:
+      type: string
+      enum: [READY, BUSY, DRAINING]
+
+    DeviceType:
+      type: string
+      enum: [CPU, GPU]
+
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        server_id:
+          type: string
+          example: compute-1
+        endpoint:
+          type: string
+          description: Base URL of compute agent (not LMStudio)
+          example: http://192.168.1.50:8081
+        models:
+          type: array
+          items:
+            type: string
+          example: ["llama3.1-8b-instruct-q4_k_m", "mistral-7b-instruct-q4"]
+        max_concurrency:
+          type: integer
+          minimum: 1
+          example: 1
+        context_limit:
+          type: integer
+          nullable: true
+          description: Optional max context length supported
+          example: 8192
+        device_type:
+          $ref: "#/components/schemas/DeviceType"
+        vram_gb:
+          type: number
+          nullable: true
+          example: 12
+      required: [server_id, endpoint, models, max_concurrency, device_type]
+
+    HeartbeatRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        server_id:
+          type: string
+          example: compute-1
+        timestamp_ms:
+          type: integer
+          format: int64
+          example: 1760000000123
+        status:
+          $ref: "#/components/schemas/Status"
+        in_flight:
+          type: integer
+          minimum: 0
+          example: 0
+        ema_tps:
+          type: number
+          nullable: true
+          description: Exponential moving average tokens/sec (real or estimated)
+          example: 28.4
+        last_job_ms:
+          type: integer
+          nullable: true
+          example: 1420
+      required: [server_id, timestamp_ms, status, in_flight]
+
+    RouteRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        request_id:
+          type: string
+          description: UUID generated by client (idempotency key)
+          example: 0f6f0c2a-44a6-4db3-9f55-dedddaf9d7ce
+        timestamp_ms:
+          type: integer
+          format: int64
+          example: 1760000000456
+        model_id:
+          type: string
+          example: llama3.1-8b-instruct-q4_k_m
+        prompt_chars:
+          type: integer
+          minimum: 0
+          example: 812
+        estimated_prompt_tokens:
+          type: integer
+          nullable: true
+          minimum: 0
+          description: Optional; if omitted, router may approximate from chars
+          example: 203
+        max_tokens:
+          type: integer
+          minimum: 1
+          example: 256
+      required: [request_id, timestamp_ms, model_id, prompt_chars, max_tokens]
+
+    RouteResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        request_id:
+          type: string
+        server_id:
+          type: string
+        endpoint:
+          type: string
+          description: Base URL of compute agent to call /run on
+        reason:
+          type: string
+          description: Debug reason for routing choice (optional but useful)
+          example: least_in_flight_tie_break_by_estimated_runtime
+      required: [request_id, server_id, endpoint, reason]
+
+    Role:
+      type: string
+      enum: [system, user, assistant]
+
+    Message:
+      type: object
+      additionalProperties: false
+      properties:
+        role:
+          $ref: "#/components/schemas/Role"
+        content:
+          type: string
+      required: [role, content]
+
+    RunRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        request_id:
+          type: string
+        timestamp_ms:
+          type: integer
+          format: int64
+        model_id:
+          type: string
+        max_tokens:
+          type: integer
+          minimum: 1
+        messages:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/Message"
+      required: [request_id, timestamp_ms, model_id, max_tokens, messages]
+
+    Usage:
+      type: object
+      additionalProperties: false
+      properties:
+        prompt_tokens:
+          type: integer
+          minimum: 0
+          nullable: true
+        completion_tokens:
+          type: integer
+          minimum: 0
+          nullable: true
+        total_tokens:
+          type: integer
+          minimum: 0
+          nullable: true
+      required: [prompt_tokens, completion_tokens, total_tokens]
+
+    Timing:
+      type: object
+      additionalProperties: false
+      properties:
+        elapsed_ms:
+          type: integer
+          minimum: 0
+      required: [elapsed_ms]
+
+    Output:
+      type: object
+      additionalProperties: false
+      properties:
+        role:
+          $ref: "#/components/schemas/Role"
+        content:
+          type: string
+      required: [role, content]
+
+    RunResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        request_id:
+          type: string
+        model_id:
+          type: string
+        cached:
+          type: boolean
+          nullable: true
+          description: Present and true if served from idempotency cache
+        output:
+          $ref: "#/components/schemas/Output"
+        usage:
+          $ref: "#/components/schemas/Usage"
+        timing:
+          $ref: "#/components/schemas/Timing"
+      required: [request_id, model_id, output, usage, timing]
+
