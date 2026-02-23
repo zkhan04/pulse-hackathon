@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import time
 from collections import OrderedDict
@@ -11,6 +12,12 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 Role = Literal['system', 'user', 'assistant']
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+)
+logger = logging.getLogger("compute-agent")
 
 
 class Message(BaseModel):
@@ -66,7 +73,7 @@ class AgentConfig(BaseModel):
     mock_mode: bool = True
     request_timeout_seconds: float = 30.0
     model_map: dict[str, str] = {}
-    router_url: str = 'http://127.0.0.1:8080'
+    router_url: str = 'http://192.168.1.2:8080'
     server_id: str = 'compute-1'
     public_endpoint: str = 'http://127.0.0.1:8081'
     heartbeat_interval_seconds: float = 2
@@ -277,6 +284,7 @@ heartbeat_task: Optional[asyncio.Task] = None
 
 
 async def send_register(client: httpx.AsyncClient) -> None:
+    logger.info(f"Registering {config.server_id} with router at {config.router_url}")
     payload = {
         'server_id': config.server_id,
         'endpoint': config.public_endpoint,
@@ -286,8 +294,10 @@ async def send_register(client: httpx.AsyncClient) -> None:
         'device_type': config.device_type,
         'vram_gb': config.vram_gb,
     }
+    logger.info(f"{config.router_url.rstrip('/')}/register")
     response = await client.post(f"{config.router_url.rstrip('/')}/register", json=payload)
     response.raise_for_status()
+    logger.info("Registration successful")
 
 
 async def send_heartbeat(client: httpx.AsyncClient) -> None:
@@ -323,12 +333,14 @@ async def router_heartbeat_loop() -> None:
             except Exception as exc:  # noqa: BLE001
                 state.router_registered = False
                 state.router_last_error = f'{exc.__class__.__name__}: {exc}'
+                logger.warning(f"Router communication failed: {state.router_last_error}")
                 await asyncio.sleep(register_backoff)
                 register_backoff = min(register_backoff * 2, 10.0)
 
 
 @app.on_event('startup')
 async def startup_event() -> None:
+    logger.info(f"Starting agent {config.server_id} on {config.host}:{config.port}")
     global heartbeat_task
     if config.heartbeat_enabled:
         heartbeat_task = asyncio.create_task(router_heartbeat_loop())
@@ -336,6 +348,7 @@ async def startup_event() -> None:
 
 @app.on_event('shutdown')
 async def shutdown_event() -> None:
+    logger.info("Shutting down agent...")
     if heartbeat_task:
         heartbeat_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -360,12 +373,14 @@ async def health() -> dict:
 
 @app.post('/run', response_model=RunResponse, responses={400: {'model': ErrorResponse}, 429: {'model': ErrorResponse}, 504: {'model': ErrorResponse}})
 async def run_completion(req: RunRequest) -> RunResponse:
+    logger.info(f"[{req.request_id}] Received request for {req.model_id}")
     if config.model_map and req.model_id not in config.model_map:
         raise HTTPException(status_code=400, detail=f'Unknown model_id: {req.model_id}')
 
     async with state._lock:
         cached = state.get_cached(req.request_id)
         if cached is not None:
+            logger.info(f"[{req.request_id}] Returning cached response")
             return RunResponse.model_validate(cached)
 
         existing_future = state.get_inflight_future(req.request_id)
@@ -376,6 +391,7 @@ async def run_completion(req: RunRequest) -> RunResponse:
             shared_future = None
 
         if shared_future is None and state.in_flight >= config.max_concurrency:
+            logger.warning(f"[{req.request_id}] Rejected: Server busy (in_flight={state.in_flight})")
             state.status = 'BUSY'
             raise HTTPException(status_code=429, detail='SERVER_BUSY')
         if shared_future is None:
@@ -389,6 +405,7 @@ async def run_completion(req: RunRequest) -> RunResponse:
         payload = await shared_future
         payload = dict(payload)
         payload['cached'] = True
+        logger.info(f"[{req.request_id}] Returning shared future result")
         return RunResponse.model_validate(payload)
 
     started = time.perf_counter()
@@ -408,11 +425,14 @@ async def run_completion(req: RunRequest) -> RunResponse:
             'timing': {'elapsed_ms': elapsed_ms},
         }
         state.put_cached(req.request_id, response_payload)
+        logger.info(f"[{req.request_id}] Completed in {elapsed_ms}ms")
         return RunResponse.model_validate(response_payload)
     except HTTPException as e:
+        logger.error(f"[{req.request_id}] HTTP error: {e.detail}")
         caught_http_exc = e
         raise e
     except Exception as e:  # noqa: BLE001
+        logger.exception(f"[{req.request_id}] Unhandled error")
         caught_other_exc = e
         raise HTTPException(status_code=504, detail=f'Unhandled compute error: {e.__class__.__name__}') from e
     finally:

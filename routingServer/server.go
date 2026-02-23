@@ -2,7 +2,7 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -83,7 +83,7 @@ func RegisterHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	registryMutex.Unlock()
 
-	fmt.Printf("Registered: %s at %s\n", req.ServerId, req.Endpoint)
+	log.Printf("Registered: %s at %s", req.ServerId, req.Endpoint)
 	json.NewEncoder(w).Encode(OkResponse{Ok: true}) // [cite: 210]
 }
 
@@ -95,6 +95,7 @@ func HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
 
 	var req HeartbeatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("Heartbeat decode error: %v", err)
 		w.WriteHeader(400)
 		return
 	}
@@ -113,6 +114,7 @@ func HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		registryMutex.Unlock()
+		log.Printf("Heartbeat from unknown server: %s", req.ServerId)
 		http.Error(w, "Unknown server_id (register first)", http.StatusBadRequest)
 		return
 	}
@@ -125,6 +127,7 @@ func HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
 func RouteHandler(w http.ResponseWriter, r *http.Request) {
 	var req RouteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("Route decode error: %v", err)
 		w.WriteHeader(400)
 		return
 	}
@@ -146,6 +149,7 @@ func RouteHandler(w http.ResponseWriter, r *http.Request) {
 
 	// If already populated by another goroutine, return it
 	if entry.Response != nil {
+		log.Printf("Route cache hit for %s -> %s", req.RequestId, entry.Response.ServerId)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(entry.Response)
 		return
@@ -177,6 +181,7 @@ func RouteHandler(w http.ResponseWriter, r *http.Request) {
 	registryMutex.RUnlock()
 
 	if !found {
+		log.Printf("No capable servers for request %s (model: %s)", req.RequestId, req.ModelId)
 		w.WriteHeader(503) // [cite: 246]
 		json.NewEncoder(w).Encode(map[string]string{"error": "NO_CAPABLE_SERVERS"})
 		return
@@ -190,6 +195,7 @@ func RouteHandler(w http.ResponseWriter, r *http.Request) {
 		Reason:    "least_in_flight_tie_break_runtime",
 	}
 
+	log.Printf("Routed %s to %s (InFlight: %d)", req.RequestId, bestID, minInFlight)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(entry.Response)
 }
@@ -209,7 +215,7 @@ func main() {
 			registryMutex.Lock()
 			for id, ctx := range registry {
 				if now-ctx.State.LastSeenAt > 7000 {
-					fmt.Printf("Pruning dead server: %s\n", id)
+					log.Printf("Pruning dead server: %s", id)
 					delete(registry, id)
 				}
 			}
@@ -231,6 +237,6 @@ func main() {
 		}
 	}()
 
-	fmt.Println("Router starting on :8080...")
+	log.Println("Router starting on :8080...")
 	http.ListenAndServe(":8080", nil)
 }
