@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import os
 import time
@@ -65,6 +66,15 @@ class AgentConfig(BaseModel):
     mock_mode: bool = True
     request_timeout_seconds: float = 30.0
     model_map: dict[str, str] = {}
+    router_url: str = 'http://127.0.0.1:8080'
+    server_id: str = 'compute-1'
+    public_endpoint: str = 'http://127.0.0.1:8081'
+    heartbeat_interval_seconds: float = 2
+    heartbeat_enabled: bool = True
+    register_models: list[str] = []
+    device_type: Literal['CPU', 'GPU'] = 'CPU'
+    context_limit: Optional[int] = None
+    vram_gb: Optional[float] = None
 
 
 class AgentState:
@@ -78,6 +88,9 @@ class AgentState:
         self._lock = asyncio.Lock()
         self._cache: OrderedDict[str, tuple[float, dict]] = OrderedDict()
         self._inflight_by_request: dict[str, asyncio.Future] = {}
+        self.router_registered = False
+        self.router_last_heartbeat_ms: Optional[int] = None
+        self.router_last_error: Optional[str] = None
 
     def _prune_cache(self) -> None:
         now = time.time()
@@ -153,6 +166,15 @@ def load_config() -> AgentConfig:
     except json.JSONDecodeError:
         model_map = {}
 
+    raw_register_models = os.getenv('REGISTER_MODELS', '').strip()
+    register_models = [m.strip() for m in raw_register_models.split(',') if m.strip()] if raw_register_models else []
+
+    context_limit_raw = os.getenv('CONTEXT_LIMIT')
+    context_limit = int(context_limit_raw) if context_limit_raw else None
+
+    vram_gb_raw = os.getenv('VRAM_GB')
+    vram_gb = float(vram_gb_raw) if vram_gb_raw else None
+
     return AgentConfig(
         host=os.getenv('HOST', '0.0.0.0'),
         port=int(os.getenv('PORT', '8081')),
@@ -164,7 +186,24 @@ def load_config() -> AgentConfig:
         mock_mode=os.getenv('MOCK_MODE', 'true').lower() == 'true',
         request_timeout_seconds=float(os.getenv('REQUEST_TIMEOUT_SECONDS', '30')),
         model_map=model_map,
+        router_url=os.getenv('ROUTER_URL', 'http://192.168.1.2:8080'),
+        server_id=os.getenv('SERVER_ID', 'compute-1'),
+        public_endpoint=os.getenv('PUBLIC_ENDPOINT', 'http://127.0.0.1:8081'),
+        heartbeat_interval_seconds=float(os.getenv('HEARTBEAT_INTERVAL_SECONDS', '1.5')),
+        heartbeat_enabled=os.getenv('HEARTBEAT_ENABLED', 'true').lower() == 'true',
+        register_models=register_models,
+        device_type='GPU' if os.getenv('DEVICE_TYPE', 'CPU').upper() == 'GPU' else 'CPU',
+        context_limit=context_limit,
+        vram_gb=vram_gb,
     )
+
+
+def models_for_registration(config: AgentConfig) -> list[str]:
+    if config.register_models:
+        return config.register_models
+    if config.model_map:
+        return sorted(config.model_map.keys())
+    return ['default']
 
 
 def estimate_tokens_from_text(text: str) -> int:
@@ -234,6 +273,73 @@ async def call_lmstudio(req: RunRequest, config: AgentConfig) -> tuple[str, dict
 config = load_config()
 state = AgentState(config)
 app = FastAPI(title='Compute Agent', version='0.0.1')
+heartbeat_task: Optional[asyncio.Task] = None
+
+
+async def send_register(client: httpx.AsyncClient) -> None:
+    payload = {
+        'server_id': config.server_id,
+        'endpoint': config.public_endpoint,
+        'models': models_for_registration(config),
+        'max_concurrency': config.max_concurrency,
+        'context_limit': config.context_limit,
+        'device_type': config.device_type,
+        'vram_gb': config.vram_gb,
+    }
+    response = await client.post(f"{config.router_url.rstrip('/')}/register", json=payload)
+    response.raise_for_status()
+
+
+async def send_heartbeat(client: httpx.AsyncClient) -> None:
+    payload = {
+        'server_id': config.server_id,
+        'timestamp_ms': int(time.time() * 1000),
+        'status': state.status,
+        'in_flight': state.in_flight,
+        'ema_tps': state.ema_tps,
+        'last_job_ms': state.last_job_ms,
+    }
+    response = await client.post(f"{config.router_url.rstrip('/')}/heartbeat", json=payload)
+    response.raise_for_status()
+    state.router_last_heartbeat_ms = int(time.time() * 1000)
+    state.router_last_error = None
+
+
+async def router_heartbeat_loop() -> None:
+    timeout = httpx.Timeout(connect=2.0, read=5.0, write=5.0, pool=5.0)
+    register_backoff = 1.0
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        while True:
+            try:
+                if not state.router_registered:
+                    await send_register(client)
+                    state.router_registered = True
+                    register_backoff = 1.0
+                await send_heartbeat(client)
+                await asyncio.sleep(max(0.5, config.heartbeat_interval_seconds))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                state.router_registered = False
+                state.router_last_error = f'{exc.__class__.__name__}: {exc}'
+                await asyncio.sleep(register_backoff)
+                register_backoff = min(register_backoff * 2, 10.0)
+
+
+@app.on_event('startup')
+async def startup_event() -> None:
+    global heartbeat_task
+    if config.heartbeat_enabled:
+        heartbeat_task = asyncio.create_task(router_heartbeat_loop())
+
+
+@app.on_event('shutdown')
+async def shutdown_event() -> None:
+    if heartbeat_task:
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
 
 
 @app.get('/health')
@@ -246,6 +352,9 @@ async def health() -> dict:
         'status': state.status,
         'last_job_ms': state.last_job_ms,
         'ema_tps': state.ema_tps,
+        'router_registered': state.router_registered,
+        'router_last_heartbeat_ms': state.router_last_heartbeat_ms,
+        'router_last_error': state.router_last_error,
     }
 
 

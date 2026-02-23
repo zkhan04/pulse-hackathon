@@ -88,6 +88,11 @@ func RegisterHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	var req HeartbeatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -96,15 +101,24 @@ func HeartbeatHandler(w http.ResponseWriter, r *http.Request) {
 
 	registryMutex.Lock()
 	if ctx, exists := registry[req.ServerId]; exists {
+		var emaTps float32
+		if req.EmaTps != nil {
+			emaTps = *req.EmaTps
+		}
 		ctx.State = DynamicState{
 			Status:     string(req.Status),
 			InFlight:   req.InFlight,
-			EmaTps:     *req.EmaTps, // [cite: 368]
-			LastSeenAt: req.TimestampMs,
+			EmaTps:     emaTps,
+			LastSeenAt: time.Now().UnixMilli(),
 		}
+	} else {
+		registryMutex.Unlock()
+		http.Error(w, "Unknown server_id (register first)", http.StatusBadRequest)
+		return
 	}
 	registryMutex.Unlock()
 
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(OkResponse{Ok: true})
 }
 
