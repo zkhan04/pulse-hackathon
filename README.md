@@ -8,7 +8,7 @@ Who loses this resource?
 People who use LLM’s with low performing devices. Companies owning data centers also lose money because of efficient computing power. 
 
 How is this minimal effort if you have to install LM studio to get each model? 
-	Because of the time constraints, we were not able to find an easier substitute. With more time, we would host the model on the interface to avoid extra installations. 
+Because of the time constraints, we were not able to find an easier substitute. With more time, we would host the model on the interface to avoid extra installations. 
 
 How to start up the server?
 
