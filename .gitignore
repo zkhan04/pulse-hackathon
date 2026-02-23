@@ -7,4 +7,5 @@ build/
 routingServer/router
 .venv
 __pycache__/
+venv
 
