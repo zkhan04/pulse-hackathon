@@ -1,23 +1,12 @@
 # Pulse Hackathon
 
-What is our Goal?
+## What is our goal?
 
-To avoid overusing data center computing power, we created a network that can send LLM queries to higher performing devices on a centralized server.  This also has positive environmental effects, since less resources at data centers will be used(ie water). 
+To avoid reliance on data centers, we created a system that allows capable devices on a network to register themselves as LLM servers. Lower-powered devices, such as smartphones, can send a request to the central server to learn about LLM servers on the network and their status.
 
-Another resource being saved is querying time, as queries would be answered faster 
+## How to start up the routing server
 
-Who loses this resource? 
-
-People who use LLM’s with low performing devices. Companies owning data centers also lose money because of efficient computing power. 
-
-
-How is this minimal effort if you have to install LM studio to get each model? 
-
-Because of the time constraints, we were not able to find an easier substitute. With more time, we would host the model on the interface to avoid extra installations. 
-
-How to start up the server?
-
-To start the server the desired device must be set to a static IP 
+To start the server, the desired device must be set to a static IP 
 
 For local installations set this IP to 192.186.1.2
 
@@ -31,27 +20,29 @@ docker load -i pulse-router_offline.tar
 
 docker run -d --name pulse-router -p 8080:8080 pulse-router:offline
 
-NOTE: Make sure you’re not on a corperate managed network, since firewalls can get in the way of testing and Static IPs cant be set on these networks
+NOTE: Make sure you’re not on a corporate managed network, since firewalls can get in the way of testing and static IPs cannot be set on these networks.
 
-
-## LLM Chat Frontend (Demo)
-
-This folder contains a minimal frontend demo implementing a simple chat UI with:
-
-- model selection dropdown
-- chat history
-- sidebar with multiple chats
-- a textbox/composer for prompts
-
-Files added:
-
-- index.html — main UI
-- styles.css — styling
-- app.js — chat state, mock LLM replies, and localStorage persistence
+## How to start up the client frontend
 
 Run locally: run "npm run dev"
 
-Notes: The demo uses a mock reply generator in `app.js`. Replace the mock call with an API request to your LLM backend when ready.
+## Implementation details
 
+### Compute server - routing server interactions
+* The core of this system is the routing server, whose IP address is known to all devices on the network. Currently, this constraint is satisfied by assigning it a static IP.
+* If a machine wants to act as an LLM server on a network, it sends a registration request to the routing server.
+* Every 2 seconds, LLM servers send a heartbeat to the routing server to signal liveness, as well as send performance statistics (current in-flight requests, estimated tokens-per-second output).
+* If three heartbeats are missed, then the routing server will no longer consider the LLM server to be live and will stop redirecting requests.
+
+### User - routing server interactions
+* When a user sends a message, the client will first send a request to the routing server containing metadata (query length, requested model).
+* The routing server selects the optimal compute server based on the performance statistics it receives from heartbeats, and sends its info back to the user.
+
+### User - compute server interactions
+* Upon receiving a response from the routing server, the client will send the full LLM query to a FastAPI endpoint on the specified compute server.
+* The compute server will forward the request to a locally running instance of LMStudio. After LMStudio responds with the LLM output, the FastAPI layer will compute + store some performance statistics, and send the output back to the user.
+
+
+### System design diagram
 <img width="1134" height="717" alt="image" src="https://github.com/user-attachments/assets/e46ea095-e96c-47f4-b034-cacd513288be" />
 
