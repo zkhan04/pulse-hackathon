@@ -53,4 +53,5 @@ Run locally: run "npm run dev"
 
 Notes: The demo uses a mock reply generator in `app.js`. Replace the mock call with an API request to your LLM backend when ready.
 
-<img width="1139" height="715" alt="image" src="https://github.com/user-attachments/assets/9231eccc-c913-4311-874b-7548333afd68" />
+<img width="1134" height="717" alt="image" src="https://github.com/user-attachments/assets/e46ea095-e96c-47f4-b034-cacd513288be" />
+
